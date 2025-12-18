@@ -1,0 +1,279 @@
+//******************************************************************************
+// MSP430FR6989 - Blank Slate Sensor Reading Template (3 Sensors) [SMOOTH TURNING]
+// Changes:
+// - Keep TA1 in CONTINUOUS mode only (ultrasonic timing).
+// - Move ultrasonic + control loop to TB0 ISR every 10 ms.
+// - Use target speeds + slew limiting (no big jumps inside ISR).
+//******************************************************************************
+
+#include <msp430.h>
+#include <stdlib.h>
+#include <math.h>
+
+// LCD Segment Lookup Table
+#define SEGA 0b1000000000000000
+#define SEGB 0b0100000000000000
+#define SEGC 0b0010000000000000
+#define SEGD 0b0001000000000000
+#define SEGE 0b0000100000000000
+#define SEGF 0b0000010000000000
+#define SEGG 0b0000001000000000
+#define SEGM 0b0000000100000000
+#define SEGH 0b0000000010000000
+#define SEGJ 0b0000000001000000
+#define SEGK 0b0000000000100000
+#define SEGP 0b0000000000010000
+#define SEGQ 0b0000000000001000
+#define SEGN 0b0000000000000010
+#define SEGDP 0b0000000000000001
+
+const unsigned int segLUT[] = {
+SEGA+SEGB+SEGC+SEGD+SEGE+SEGF, // 0
+SEGB+SEGC, // 1
+SEGA+SEGB+SEGD+SEGE+SEGG+SEGM, // 2
+SEGA+SEGB+SEGC+SEGD+SEGG+SEGM, // 3
+SEGB+SEGC+SEGF+SEGG+SEGM, // 4
+SEGA+SEGC+SEGD+SEGF+SEGG+SEGM, // 5
+SEGA+SEGC+SEGD+SEGE+SEGF+SEGG+SEGM, // 6
+SEGA+SEGB+SEGC, // 7
+SEGA+SEGB+SEGC+SEGD+SEGE+SEGF+SEGG+SEGM,// 8
+SEGA+SEGB+SEGC+SEGD+SEGF+SEGG+SEGM // 9
+};
+
+// --- Motor PWM bounds and slew ---
+#define PWM_MAX 999
+#define PWM_MIN 20
+#define SLEW_STEP 20 // PWM counts per 1 ms tick (TB0 ISR)
+
+// --- Globals ---
+volatile float distance = 0; // Distance in cm
+volatile unsigned int Right_Sensor_Value = 0; // A10 (P9.2) - left sensor
+volatile unsigned int Center_Sensor_Value = 0; // A11 (P9.3) - right sensor
+volatile unsigned int Left_Sensor_Value = 0; // A9 (P9.1) - center sensor
+volatile unsigned int Left_Sensor = 0;
+volatile unsigned int Center_Sensor= 0;
+volatile unsigned int Right_Sensor = 0;
+volatile unsigned int Stop_Motors = 0;
+int Left_Motor_Speed = 200; // initial
+int Right_Motor_Speed = 200;
+int Left_Target = 350; // slew targets
+int Right_Target = 350;
+volatile unsigned int ctrl_div = 0; // 1kHz -> 100Hz divider for control/ultrasonic
+
+// --- LCD helpers ---
+void lcd_write_digit(unsigned int digit, unsigned int value){
+unsigned int hi = segLUT[value] >> 8;
+unsigned int lo = segLUT[value] & 0xFF;
+switch(digit){
+case 1: LCDM10 = hi; LCDM11 = lo; break;
+case 2: LCDM6 = hi; LCDM7 = lo; break;
+case 3: LCDM4 = hi; LCDM5 = lo; break;
+case 4: LCDM19 = hi; LCDM20 = lo; break;
+case 5: LCDM15 = hi; LCDM16 = lo; break;
+case 6: LCDM8 = hi; LCDM9 = lo; break;
+default: break;
+}
+}
+void lcd_display_distance(float dist){
+if(dist > 999) dist = 999; // Max shown: 3 digits
+int d1 = ((int)dist / 100) % 10;
+int d2 = ((int)dist / 10) % 10;
+int d3 = ((int)dist) % 10;
+lcd_write_digit(1,d1);
+lcd_write_digit(2,d2);
+lcd_write_digit(3,d3);
+}
+int main(void)
+{
+WDTCTL = WDTPW | WDTHOLD;
+// ADC pins: P9.1 (A9), P9.2 (A10), P9.3 (A11)
+P9SEL1 |= BIT1 | BIT2 | BIT3;
+P9SEL0 |= BIT1 | BIT2 | BIT3;
+// ADC12: A9 -> A10 -> A11 sequence, 12-bit
+ADC12CTL0 = ADC12SHT0_2 | ADC12ON;
+ADC12CTL1 = ADC12SHP | ADC12CONSEQ_1;
+ADC12CTL2 = ADC12RES_2;
+ADC12MCTL0 = ADC12INCH_9; // A9 (P9.1) - center sensor
+ADC12MCTL1 = ADC12INCH_10; // A10 (P9.2) - left sensor
+ADC12MCTL2 = ADC12INCH_11 | ADC12EOS; // A11 (P9.3) - right sensor
+ADC12IER0 = ADC12IE0 | ADC12IE1 | ADC12IE2;
+ADC12CTL0 |= ADC12ENC;
+// ECHO input: P2.1
+P2DIR &= ~BIT1;
+P2SEL0 &= ~BIT1;
+P2SEL1 &= ~BIT1;
+// TA1 = CONTINUOUS for ultrasonic timing ONLY
+TA1CTL = TASSEL__SMCLK | MC__CONTINUOUS | TACLR;
+// LCD setup
+LCDCPCTL0 = 0b1111111111000000;
+LCDCPCTL1 = 0b1111000000111111;
+LCDCPCTL2 = 0b0000000011110000;
+LCDCCTL0 = LCDPRE__16 | LCD4MUX;
+LCDCMEMCTL= LCDCLRM;
+LCDCCTL0 |= LCDON;
+// PWM pins: P1.6 (TA0.1), P1.7 (TA0.2)
+P1DIR |= BIT6 | BIT7;
+P1SEL1 |= BIT6 | BIT7;
+P1SEL0 |= BIT6 | BIT7;
+// Ultrasonic TRIG pin: P1.3 (GPIO out)
+P1DIR |= BIT3;
+P1SEL1 &= ~BIT3;
+P1SEL0 &= ~BIT3;
+// H-bridge direction pins (AI1=P3.0, AI2=P3.1, BI1=P3.2, BI2=P3.3)
+P3DIR |= BIT0 | BIT1 | BIT2 | BIT3;
+// Forward: AI1=1, AI2=0, BI1=1, BI2=0
+P3OUT |= BIT0 | BIT3;
+P3OUT &= ~(BIT1 | BIT2);
+// Clock (SMCLK ~1MHz default)
+CSCTL0_H = CSKEY >> 8;
+CSCTL6 &= ~SMCLKREQEN;
+CSCTL0_H = 0;
+// Timer A0: PWM @ 1 kHz
+TA0CTL = TASSEL__SMCLK | ID__1 | MC__UP | TACLR;
+TA0CCR0 = 999;
+TA0CCTL1 = OUTMOD_6; // PWM on P1.6
+TA0CCTL2 = OUTMOD_6; // PWM on P1.7
+TA0CCR1 = Left_Motor_Speed;
+TA0CCR2 = Right_Motor_Speed;
+// Timer B0: 1 kHz tick (ADC trigger + every 10th tick do ultrasonic+control)
+TB0CTL = TBSSEL__SMCLK | ID__1 | MC__UP | TBCLR;
+TB0EX0 = TBIDEX_1;
+TB0CCR0 = 999;
+TB0CCTL0 = CCIE;
+PM5CTL0 &= ~LOCKLPM5;
+__delay_cycles(50000);
+__enable_interrupt();
+__no_operation();
+while(1){
+__bis_SR_register(LPM0_bits | GIE);
+}
+}
+// --- ADC12 ISR: read 3 sensors ---
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector = ADC12_VECTOR
+__interrupt
+#endif
+void ADC12_ISR(void)
+{
+switch (__even_in_range(ADC12IV, ADC12IV_ADC12RDYIFG)) {
+case ADC12IV_ADC12IFG0: // A9 (P9.1) - center sensor (named Left_Sensor_Value
+in orig)
+Right_Sensor_Value = ADC12MEM0;
+Right_Sensor = (Right_Sensor_Value > 250) ? 1 : 0;
+break;
+case ADC12IV_ADC12IFG1: // A10 (P9.2) - left sensor (named Right_Sensor_Value
+in orig)
+Left_Sensor_Value = ADC12MEM1;
+Left_Sensor = (Left_Sensor_Value > 1000) ? 1 : 0;
+break;
+case ADC12IV_ADC12IFG2: // A11 (P9.3) - right sensor (named Center_Sensor_Value
+in orig)
+Center_Sensor_Value = ADC12MEM2;
+Center_Sensor = (Center_Sensor_Value > 250) ? 1 : 0;
+__bic_SR_register_on_exit(LPM0_bits);
+break;
+default:
+break;
+}
+}
+// --- TB0 ISR: 1 kHz tick ---
+// - Triggers ADC every 1 ms
+// - Every 10 ms: ultrasonic using TA1R + decision logic
+// - Slew CCRs toward targets every 1 ms (smooth turning)
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector = TIMER0_B0_VECTOR
+__interrupt
+#endif
+void TIMER0_B0_ISR(void)
+{
+// 1) Keep 1 kHz ADC conversions
+ADC12CTL0 |= ADC12SC;
+// 2) Every 10 ms: ultrasonic + decision logic
+ctrl_div++;
+if (ctrl_div >= 5) {
+ctrl_div = 0;
+// ---- Ultrasonic trigger pulse ----
+P1OUT |= BIT3;
+__delay_cycles(10);
+P1OUT &= ~BIT3;
+// Wait for echo rising edge with timeout
+unsigned int timeout = 0;
+while (!(P2IN & BIT1) && timeout < 1000) { timeout++; }
+if (timeout >= 1000) {
+distance = 999; // no echo
+} else {
+unsigned int start = TA1R;
+// Wait for echo falling edge with timeout
+timeout = 0;
+while ((P2IN & BIT1) && timeout < 1000) { timeout++; }
+if (timeout >= 1000) {
+distance = 999; // stuck high
+} else {
+unsigned int end = TA1R;
+unsigned int pulseWidth = end - start;
+distance = (float)pulseWidth / 58.0f; // ~cm
+}
+}
+// Update LCD
+lcd_display_distance(distance);
+// ---- Decision logic: set targets (same behavior as before) ----
+Stop_Motors = (distance <= 10) ? 1 : 0;
+if (Stop_Motors) {
+Left_Target = PWM_MIN;
+Right_Target = PWM_MIN;
+}
+else if (Left_Sensor == 0 && Center_Sensor == 1 && Right_Sensor == 0) {
+// On line - go straight
+Left_Target = 350; Right_Target = 350;
+}
+else if (Left_Sensor == 1 && Center_Sensor == 1 && Right_Sensor == 0) {
+// Left edge detected - slight left turn
+Left_Target = 350; Right_Target = 300;
+}
+else if (Left_Sensor == 1 && Center_Sensor == 0 && Right_Sensor == 0) {
+// Far left - sharp left turn
+Left_Target = 350; Right_Target = 100;
+}
+else if (Left_Sensor == 0 && Center_Sensor == 1 && Right_Sensor == 1) {
+// Right edge detected - slight right turn
+Left_Target = 300; Right_Target = 350;
+}
+else if (Left_Sensor == 0 && Center_Sensor == 0 && Right_Sensor == 1) {
+// Far right - sharp right turn
+Left_Target = 100; Right_Target = 350;
+}
+else {
+// Default case: no line detected or other sensor combinations
+// Resume forward movement at moderate speed
+Left_Target = 350; Right_Target = 350;
+}
+}
+// 3) Slew-limit PWM toward targets (every 1 ms for smoothness)
+if (TA0CCR1 < Left_Target) {
+unsigned int next = TA0CCR1 + SLEW_STEP;
+TA0CCR1 = (next > (unsigned)Left_Target) ? Left_Target : next;
+} else if (TA0CCR1 > Left_Target) {
+unsigned int next = (TA0CCR1 > SLEW_STEP) ? (TA0CCR1 - SLEW_STEP) :
+PWM_MIN;
+TA0CCR1 = (next < (unsigned)Left_Target) ? Left_Target : next;
+}
+if (TA0CCR2 < Right_Target) {
+unsigned int next = TA0CCR2 + SLEW_STEP;
+TA0CCR2 = (next > (unsigned)Right_Target) ? Right_Target : next;
+} else if (TA0CCR2 > Right_Target) {
+unsigned int next = (TA0CCR2 > SLEW_STEP) ? (TA0CCR2 - SLEW_STEP) :
+PWM_MIN;
+TA0CCR2 = (next < (unsigned)Right_Target) ? Right_Target : next;
+}
+// 4) Clamp to safe range
+if (TA0CCR1 < PWM_MIN) TA0CCR1 = PWM_MIN;
+if (TA0CCR2 < PWM_MIN) TA0CCR2 = PWM_MIN;
+if (TA0CCR1 > PWM_MAX) TA0CCR1 = PWM_MAX;
+if (TA0CCR2 > PWM_MAX) TA0CCR2 = PWM_MAX;
+// Clear TB0 flag
+TB0CCTL0 &= ~CCIFG;
+}
+/* NOTE:
+- There is NO TIMER1_A0 ISR anymore. TA1 is used only as a free-running
+counter for ultrasonic timing (start/end captured by reading TA1R).
+*/
